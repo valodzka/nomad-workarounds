@@ -1,0 +1,727 @@
+#!/usr/bin/ruby
+
+require 'open-uri'
+require 'net/http'
+require 'json'
+require 'shellwords'
+require 'cgi'
+
+ORIGIN = 'http://localhost:4646/'
+OK, FAIL, RIGHT_ARROW, DOT = "\u2714", "\u2716", "\u2794", "\u00B7"
+
+class String
+  def black;          "\033[30m#{self}\033[0m" end
+  def red;            "\033[31m#{self}\033[0m" end
+  def green;          "\033[32m#{self}\033[0m" end
+  def brown;          "\033[33m#{self}\033[0m" end
+  def blue;           "\033[34m#{self}\033[0m" end
+  def magenta;        "\033[35m#{self}\033[0m" end
+  def cyan;           "\033[36m#{self}\033[0m" end
+  def gray;           "\033[37m#{self}\033[0m" end
+end
+
+def pretend_mode?
+  !!ENV['PRETEND']
+end
+
+def standalone_mode?
+  !!ENV['STANDALONE']
+end
+
+class NomadRequestError < StandardError
+end
+
+class NomadBadRequestError < StandardError
+end
+
+class NomadObjectNotFound < StandardError
+end
+
+def handle_http_response(resp, level: 0)
+  location = resp['location']
+
+  if location
+    raise NomadRequestError.new("To many redirects, last was: #{location}") if level > 3
+    handle_http_response(Net::HTTP.get_response(URI(ORIGIN.chomp('/') + location)), level: level + 1)
+  else
+    if resp.code != "200"
+      if resp.code.to_i % 400 < 100
+        raise NomadBadRequestError.new("Bad request: #{resp.code}: #{resp.body}")
+      else
+        raise NomadRequestError.new("Failed request: #{resp.code}: #{resp.body}")
+      end
+    else
+      JSON.parse(resp.body)
+    end
+  end
+end
+
+def request_execute(cmd, params: nil)
+  uri = URI("#{ORIGIN}v1/#{cmd}")
+
+  if params
+    
+    resp = Net::HTTP.new(uri.host, uri.port).
+             post(uri.path, params.to_json,
+                  {'Content-Type' => 'application/json'})
+
+    handle_http_response(resp)
+  else
+    resp = Net::HTTP.get_response(URI(uri))
+    handle_http_response(resp)
+  end
+rescue SystemCallError => e
+  raise NomadRequestError.new(e)
+end
+
+def request(cmd, params: nil, retries: nil, retry_wait: 1, wait_evaluation: false)
+  retries = retries || (params ? 0 : 2) # retry get by default
+  begin 
+    resp = request_execute(cmd, params: params)
+    wait_evaluation_complete(resp) if wait_evaluation
+    resp
+  rescue NomadRequestError => e
+    if retries == 0
+      raise
+    else
+      puts "Retry request #{cmd} (#{e})"
+      retries -= 1
+      sleep retry_wait
+      retry
+    end
+  end
+end
+
+def wait_evaluation_complete(id)
+  eval_id = id.is_a?(String) ? id : id['EvalID'] 
+  while true
+    resp = request("/evaluation/#{eval_id}")
+    status = resp["Status"]
+    if status != 'blocked' && status != 'pending'
+      puts "Eval #{eval_id[0...8]} resolved to #{status}"
+      break
+    end
+    sleep 0.5
+  end
+end
+
+def time_to_interval(time = nil, interval: nil)
+  seconds = interval || Time.now - parse_time(time)
+  minutes = seconds / 60.0
+  hours = minutes / 60.0
+  days = hours / 24.0
+  unit = if days > 2
+           [days, 'd']
+         elsif hours > 2
+           [hours, 'h']
+         elsif minutes > 1
+           [minutes, 'm']
+         else
+           [seconds, 's']
+         end
+  
+  "%.1f%s" % unit
+end
+
+def parse_time(time)
+  case time
+  when Time, NilClass
+    time
+  when Integer
+    Time.at(time/1_000_000_000)
+  else
+    Time.parse(time)
+  end
+end
+
+def colorize_state(state)
+  case state
+  when 'running', 'run'
+    state.green
+  when 'pending'
+    state.gray
+  when 'stop'
+    state.red
+  else
+    state.magenta
+  end
+end
+
+SKIP_EVENTS_IN_STATUS = { 'Received' => true,
+                          'Task Setup' => true,
+                          'Driver' => true,
+                          'Downloading Artifacts' => true }
+DETAILED_EVENTS = { 'Restart Signaled' => true,
+                    'Killing' => true }
+
+def alloc_extract_name_index(name)
+  raise "Invalid alloc full name: #{name}" unless name =~ /^([^\[\]]+)\[(\d+)\]$/
+  [$1, $2.to_i]
+end
+
+class JobStatus
+  attr_reader :out, :collisions_data
+  
+  def initialize(out, collisions_data)
+    @out = out
+    @collisions_data = collisions_data
+  end
+  
+  def print_status
+    @out.sort_by{|x| x[:sort_by] }.each do |obj|
+      puts obj[:out]
+    end
+  end
+
+  def collect_collisions
+    @collisions_data.each do |ver, index_collisions|
+      index_collisions.each do |name, ids|
+        yield(ver, name, ids) if ids.size > 1
+      end
+    end
+  end
+
+  def print_collisions
+    collect_collisions do |ver, name, ids|
+      puts("Collision detected:".red + " #{ver.to_s.brown} #{name.blue}: #{ids.join(', ')}")
+    end
+  end
+end
+
+def collect_allocs_status(allocs, all: !!ENV['ALL'])
+  out = []
+  index_collisions_cont = Hash.new{|hsh, key|
+    hsh[key] = Hash.new{|h,k| h[k] = [] }
+  }
+  
+  max_version = allocs.map{|j| j['JobVersion'] }.max
+  allocs.each do |j|
+    client_status = j['ClientStatus']
+    next if client_status == 'complete' && !all
+    text = ""
+    # puts JSON.dump(j)
+    id, version, name, desired_status, desired_desc = j['ID'], j['JobVersion'], j['Name'], j['DesiredStatus'], j['DesiredDescription']
+    if client_status == 'running'
+      index_collisions_cont[version][name] << id
+    end
+
+    
+    text << id[0...8] << ' '
+    if version
+      text << version.to_s.send(max_version == version ? :brown : :gray) << ' '
+    end
+      
+    text << name.blue
+    if desired_status != 'run' || (desired_desc != '' && desired_desc != nil)
+      text << " > #{colorize_state(desired_status)} (#{desired_desc}),"
+    end
+    text << ' ' << j['NodeName']
+
+    text << ': ' << colorize_state(client_status)
+    (j['TaskStates'] || []).each do |name, status|
+      state = colorize_state(status['State'])
+      append = " | #{name} #{state}"
+      started_at = parse_time(status['StartedAt'])
+      finished_at = parse_time(status['FinishedAt'])
+      append << ' time=' << time_to_interval(interval: finished_at-started_at) if started_at && finished_at
+      append << ' ' << FAIL.red if status['Failed']
+        
+      restarts = status['Restarts']
+      append << " restarts=#{restarts}" if restarts > 0
+
+      events = status['Events']
+      append << ' ['
+      events_out = []
+      events.each do |ev|
+        type = ev['Type']
+        unless SKIP_EVENTS_IN_STATUS[type]
+          event_out = type.dup
+          if DETAILED_EVENTS[type]
+            dm = ev['DisplayMessage']
+            unless dm.match(/Sent interrupt. Waiting [0-9a-z]+ before force killing/)
+              event_out << '<' << dm << '>'
+            end
+          end
+          event_out << ':' << time_to_interval(ev['Time'])
+          events_out << event_out
+        end
+      end
+      if events_out.size > 5
+        append << "..." << events_out[-5..-1].join(' ')
+      else
+        append << events_out.join(' ')
+      end
+      append << ']'
+      
+      text << append.gray
+    end
+    text << "\n"
+    name, index = alloc_extract_name_index(j['Name'])
+    out.push({ out: text, sort_by: [name, index, version] })
+  end
+
+  JobStatus.new(out, index_collisions_cont)
+end
+
+def print_allocs_status(allocs, only_if_collision: false)
+  jst = collect_allocs_status(allocs)
+  jst.print_status unless only_if_collision
+  jst.print_collisions
+end
+
+def collect_collisions(id)
+  allocs = request("job/#{id}/allocations")
+  raise NomadObjectNotFound.new("Allocs not found for job=#{id}") if allocs.empty?
+  jst = collect_allocs_status(allocs)
+  collisions = {}
+  jst.collect_collisions do |ver, full_name, ids|
+    name, index = alloc_extract_name_index(full_name)
+    collisions[name] = [collisions[name] || 100000000, index].min
+  end
+
+  collisions
+end
+
+class JobUpdater
+  attr_reader :prev_version
+  
+  def initialize(id)
+    @id = id
+    @pretend = pretend_mode?
+  end
+
+  def pretend?; @pretend; end
+  
+  def try_update_definition(&updater)
+    job_definition = request("job/#@id")
+    @prev_version = job_definition["Version"]
+    updater.call(job_definition)
+    
+    plan_result = request("job/#@id/plan", params: { "Job": job_definition })
+    if failed_allocs = plan_result["FailedTGAllocs"]
+      puts "Failed to plan job #@id update, aborting update: #{failed_allocs}"
+      return false
+    end
+    
+    update_payload = {
+      "Job": job_definition,
+      "EnforceIndex": true,
+      "JobModifyIndex": job_definition["JobModifyIndex"]
+    }
+    if @pretend
+      puts "Pretending to request job #@id update"
+    else
+      request("job/#@id", params: update_payload, wait_evaluation: true)
+    end
+
+    return true
+  end
+
+  def revert
+    revert_payload = {
+      "JobID": @id,
+      "JobVersion": @prev_version,
+      "EnforcePriorVersion": @prev_version + 1                
+    }
+    if @pretend
+      puts "Pretending to revert job to #@id to #{@prev_version}"
+    else
+      # try to retry revert multple times to avoid stucking in modified state
+      request("job/#@id/revert", params: revert_payload, retries: 2, wait_evaluation: true)
+    end
+    self
+  end
+
+  def wait_deployment_complete
+    wait_deployment_complete_for_id(job_id: @id)
+  end
+
+  private
+  
+  def wait_deployment_complete_for_id(job_id:)
+    idx = 0
+    while true
+      deployment = request("/job/#{job_id}/deployment")
+      raise NomadObjectNotFound.new("job=#{job_id} not found") unless deployment
+      
+      if deployment["Status"] == "running"
+        print(idx == 0 ? "Waiting untill #{job_id} deployment finished" : ".")
+        sleep 4
+        idx += 1
+        next
+      else
+        did_wait = idx > 0
+        puts if did_wait
+        return did_wait
+      end
+    end
+  end
+end
+
+def replace_or_add_constraint(constraints, key, val)
+  if constraints
+    idx = constraints.find_index{|c| c['LTarget'] == key }
+    if idx
+      constraints[idx] = val
+    else
+      constraints << val
+    end
+  else
+    constraints = [val]
+  end
+
+  constraints
+end
+
+def patch_job_to_resolve_collisions!(job, collisions)
+  collisions.each do |group_name, collision_index|
+    target_group = job['TaskGroups'].find{|group| group["Name"] == group_name }
+    raise NomadObjectNotFound.new("group=#{group_name} job=#{job}") unless target_group
+    original_count = target_group["Count"]
+    target_group["Count"] = collision_index + 1
+    
+    backup_key = "${meta.original_count_backup}"
+    new_constraint = {"LTarget": backup_key,"RTarget": original_count.to_s,"Operand": "!="}
+    target_group["Constraints"] = replace_or_add_constraint(target_group["Constraints"], backup_key, new_constraint)
+    puts "Group #{group_name} patched: Count = #{original_count} -> #{collision_index+1}, Constraints += #{new_constraint}"
+  end
+end
+
+# TODO: might fail in case of nomad request issues, might cause situation when process remains in low process number mode
+# it's possible to use stored in constraints value of original_count_backup, but not implemented currently
+def resolve_collisions(id)
+  #debug_idx = 0
+  updater = JobUpdater.new(id)
+  refresh_collisions = true
+  while refresh_collisions
+    collisions = collect_collisions(id)
+    #collisions['main'] = 0 if debug_idx < 1
+    return if collisions.empty?
+
+    refresh_collisions = updater.wait_deployment_complete
+    #debug_idx += 1
+  end
+
+  updater.try_update_definition do |job_definition|
+    patch_job_to_resolve_collisions!(job_definition, collisions)
+  end or return
+  
+  puts "Collisions detected for #{id} at version=#{updater.prev_version} for groups #{collisions.inspect}, executing job update"
+
+  wait_timeout = 100.times do |it|
+    collisions_count = collect_collisions(id).size
+    break if collisions_count == 0 || updater.pretend?
+    puts "Waiting untill collision resolved ##{it} (has #{collisions_count})"
+    sleep 2
+  end
+
+  puts("Collision %s, executing rollback to job version=%d" % [wait_timeout ? 'timeout' : 'resolved', updater.prev_version])
+  updater.revert.wait_deployment_complete
+end
+
+def resolve_all_collisions
+  request("jobs").each do |job|
+    next if job['Status'] != 'running' || job['Type'] != 'service' || job['JobSummary']['Summary'].all?{|group, status| status['Running'] < 2 }
+    resolve_collisions job['ID']
+  end
+end
+
+# move_spec:
+#  group_name != node_name (, ...)?
+def patch_job_to_move_alloc!(job, move_spec)
+  move_spec.split(',').each do |move|
+    group_name, node = *move.split('!=').map(&:strip)
+    target_group = job['TaskGroups'].find{|group| group["Name"] == group_name }
+    raise NomadObjectNotFound.new("group=#{group_name} job=#{job}")
+    new_constraint = {"LTarget": "${node.unique.name}", "RTarget": node, "Operand": "!="}
+    (target_group["Constraints"] ||= []) << new_constraint
+    puts "Group #{group_name} patched: Constraints += #{new_constraint}"
+  end
+end
+
+def move_alloc(id, alloc_name, to_server)
+  updater = JobUpdater.new(id)
+  updater.wait_deployment_complete
+  puts "Updating job #{id} to move allocs"
+  
+  updater.try_update_definition do |job_definition|
+    patch_job_to_move_alloc!(job_definition, alloc_name)
+  end or return
+  
+  updater.wait_deployment_complete
+
+  puts "Reverting job #{id} to prev version=#{updater.prev_version}"
+  updater.revert.wait_deployment_complete
+end
+
+def patch_job_to_redeploy(job, group_name)
+  now = Time.now.to_i.to_s
+  if group_name
+    target_group = job['TaskGroups'].find{|group| group["Name"] == group_name }
+    (target_group["Meta"] ||= {})["redeploy_at"] = now
+    puts "Group #{group_name} patched: Meta += { redeploy_at = #{now} }"
+  else
+    (job["Meta"] ||= {})["redeploy_at"] = now
+    puts "Job #{job} patched: Meta += { redeploy_at = #{now} }"
+  end
+end
+
+def redeploy_job(id, group_name)
+  updater = JobUpdater.new(id)
+  updater.wait_deployment_complete
+  puts "Redeployting job #{id}"
+
+  updater.try_update_definition do |job_definition|
+    patch_job_to_redeploy(job_definition, group_name)
+  end or return
+
+  updater.wait_deployment_complete
+end
+
+def print_job_status(id, only_if_collision: false)
+  allocs = request("job/#{id}/allocations")
+  raise NomadObjectNotFound.new("job=#{id} allocations") if allocs.empty?
+  print_allocs_status(allocs, only_if_collision: only_if_collision)
+end
+
+def print_node_status(node_name)
+  node_name = Socket.gethostname if node_name == 'self'
+  nodes = request("nodes?filter=Name%3D%3D#{node_name}&per_page=1")
+  raise NomadObjectNotFound.new("node=#{node_name}") if nodes.empty?
+  nodes.each do |node|
+    node_id = node['ID']
+    allocs = request("/node/#{node_id}/allocations")
+    print_allocs_status(allocs)
+  end
+end
+
+def print_job_or_node_status(id)
+  begin
+    print_job_status(id)
+  rescue NomadObjectNotFound 
+    print_node_status(id)
+  end
+end
+
+AllocTarget = Struct.new(:alloc_id, :task_name)
+
+def find_task(job, running, &filter)
+  allocs = request("job/#{job}/allocations")
+  targets = []
+  
+  allocs.each{|j|
+    status = j['ClientStatus']
+    next if running && status != 'running'
+    
+    j['TaskStates'].each do |task_name, t|
+      next if running && t['State'] != 'running'
+      targets << AllocTarget.new(j['ID'], task_name) if filter.call(j['Name'], task_name)
+    end
+  }
+
+  if targets.size == 1
+    targets[0]
+  else
+    puts("Number of tasks invalid: #{targets.size}")
+    return
+  end
+end
+
+# job.group[2].task 
+# job[2].task 
+# job[2]
+# job.group[2] 
+# job.task
+# job
+def lookup_task(filter, running:)
+  job, name_filter, task_filter = nil, nil, nil
+  m = filter.match(/^(?<job>[^.\[\]]+)(?<group>\.[^.\[\]]+)?(?:\[(?<idx>\d+)\])?(?:\.(?<task>[^.\[\]]+))?$/)
+  if m 
+    job = m[:job]
+    idx = m[:idx]
+    group_or_task = m[:group]
+    task = m[:task]
+    
+    buff = "^#{Regexp.escape(job)}"
+    if group_or_task && idx
+      buff << Regexp.escape(group_or_task)
+    else
+      buff << "\.[^.\\[\\]]+"
+    end
+    
+    buff << "\\[#{idx || 0}\\]$"
+
+    name_filter = Regexp.compile(buff)
+    task_filter = idx ? task : group_or_task
+  else
+    puts("Failed to parse filter: #{filter}")
+  end
+  filter = proc{|alloc_name, task_name|
+    name_filter.match?(alloc_name) &&
+      (task_filter ? task_filter == task_name : true)
+  }
+  
+  find_task(job, running, &filter)
+end
+
+def cmd_to_executable(cmd, command_line)
+  case command_line
+  when String
+    command_line.split(' ')
+  when nil, []
+    cmd = 'bash' if cmd == 'exec'
+    ["/bin/#{cmd}"]
+  when Array
+    command_line
+  else
+    raise "Not valid commad line: #{commad_line.inspect}"
+  end
+end
+
+def nomad_exec(filter, cmd, command_line)
+  target = lookup_task(filter, running: true)
+  if target
+    args = ["nomad", "alloc", "exec", "-task", target.task_name,
+            target.alloc_id] + cmd_to_executable(cmd, command_line)
+    exec(*args)
+  end
+end
+
+def nomad_logs(filter, where, args)
+  target = lookup_task(filter, running: true)
+  
+  if target
+    opts = ["-task #{target.task_name}"]
+    opts << '-stderr' if where != 'out'
+    opts += args
+    
+    exec("nomad alloc logs #{opts.join(' ')} #{target.alloc_id}")
+  end
+end
+
+# finish all unfinished deployments by stopping allocs that have old versions
+# must not be run when deployment already running
+def finish_failed_deployment(job_id, pretend: pretend_mode?)
+  subfilter = job_id ? "+and+JobID%3D%3D#{job_id}" : ""
+  allocs = request("allocations?task_states=false&filter=ClientStatus%3D%3Drunning#{subfilter}")
+  raise NomadObjectNotFound.new("job=#{job_id} allocations not found") if allocs.empty?
+  allocs.group_by{|a| a['JobID'] }.each do |job_id, allocs|
+    next if allocs.size < 2
+    
+    max_version = allocs.map{|a| a['JobVersion'] }.max
+    old_allocs = allocs.select{|a| a['JobVersion'] < max_version }
+    next if old_allocs.empty?
+    
+    puts "To stop #{old_allocs.size} allocation in job #{job_id} because they has version < #{max_version}"
+    old_allocs.each do |alloc|
+      puts "#{pretend ? "Pretending requesting" : "Requesting"} stop #{alloc["Name"]} with version=#{alloc["JobVersion"]}"
+      request("allocation/#{alloc['ID']}/stop", params: {}, wait_evaluation: true) unless pretend
+    end
+  end
+end
+
+def finish_all_failed_deployments
+  finish_failed_deployment(nil)
+end
+
+class Arguments
+  attr_reader :cmd, :arg, :extra
+  
+  def initialize(cmd, arg, extra)
+    @cmd = cmd
+    @arg = arg
+    @extra = extra
+  end
+end
+
+class Commands
+  attr_reader :commands
+  
+  def initialize
+    @commands = {}
+  end
+
+  def register(*names, &block)
+    names.each{|name|  @commands[name] = block }
+  end
+
+  def try_run(cmd_name, arg, extra)
+    cmd = @commands[cmd_name]
+    if cmd
+      cmd.call(Arguments.new(cmd_name, arg, extra))
+    else
+      puts "Command #{cmd_name} not found, known commands:\n\n"
+      puts "    " + @commands.keys.join(', ')
+    end
+  end
+end
+
+def register_commands
+  c = Commands.new
+
+  # allocs monipulation
+  c.register('redeploy'){|a|
+    redeploy_job(a.arg, a.extra[0])
+  }
+  c.register('move'){|a|
+    move_alloc(a.arg, a.extra[0], a.extra[1])
+  }
+  c.register('resolve-collisions'){|a|
+    resolve_collisions(a.arg)
+  }
+  c.register('resolve-all-collisions'){
+    resolve_all_collisions
+  }
+  c.register('finish-failed-deployment'){|a|
+    finish_failed_deployment(a.arg)
+  }
+  c.register('finish-all-failed-deployment'){
+    finish_all_failed_deployments
+  }
+  # status
+  c.register('node'){|a|
+    print_node_status(a.arg)
+  }
+  c.register('job'){|a|
+    print_job_status(a.arg)
+  }
+  c.register('s', 'status'){|a|
+    print_job_or_node_status(a.arg)
+  }
+  # exec
+  c.register('sh', 'bash', 'exec'){|a|
+    nomad_exec(a.arg, a.cmd, a.extra)
+  }
+  c.register('out', 'err', 'logs'){|a|
+    nomad_logs(a.arg, a.cmd, a.extra)
+  }
+  
+  c
+end
+
+COMMANDS = register_commands
+
+unless standalone_mode?
+  # load extra commands
+  begin
+    require '/etc/nomad.d/nmd_exts'
+  rescue LoadError
+  end
+  begin
+    require_relative './nmd_exts'
+  rescue LoadError
+  end
+end
+
+def execute_command(cmd, arg, extra)
+  begin
+    COMMANDS.try_run(cmd, arg, extra)
+  rescue NomadObjectNotFound => e
+    puts "Object not found: #{e.message}"
+  end
+end
+
+execute_command(ARGV[0], ARGV[1], Array(ARGV[2..]))
+
+
+      
