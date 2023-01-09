@@ -8,7 +8,7 @@ _hashicorp/nomad#698 Add ability to restart all running tasks/allocs of a job_. 
 
     nmd redeploy <job-id> (<group>)
 
-_hashicorp/nomad#10727 NOMAD_ALLOC_INDEX is not always unique within a single job version_. This resolves non uniq `NOMAD_ALLOC_INDEX` of specified job by temporarily changing number counts of affected groups (use `resolve-all-collisions` to apply fix for all jobs). 
+_hashicorp/nomad#10727 NOMAD_ALLOC_INDEX is not always unique within a single job version_. This resolves non uniq `NOMAD_ALLOC_INDEX` of specified job by temporarily changing counts of affected groups (use `resolve-all-collisions` to apply fix for all jobs). 
 
     nmd resolve-collisions <job-id>
 

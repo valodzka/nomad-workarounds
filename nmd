@@ -432,7 +432,7 @@ def patch_job_to_move_alloc!(job, move_spec)
   move_spec.split(',').each do |move|
     group_name, node = *move.split('!=').map(&:strip)
     target_group = job['TaskGroups'].find{|group| group["Name"] == group_name }
-    raise NomadObjectNotFound.new("group=#{group_name} job=#{job}")
+    raise NomadObjectNotFound.new("group=#{group_name} job=#{job}") unless target_group
     new_constraint = {"LTarget": "${node.unique.name}", "RTarget": node, "Operand": "!="}
     (target_group["Constraints"] ||= []) << new_constraint
     puts "Group #{group_name} patched: Constraints += #{new_constraint}"
@@ -675,7 +675,7 @@ def register_commands
   c.register('finish-failed-deployment'){|a|
     finish_failed_deployment(a.arg)
   }
-  c.register('finish-all-failed-deployment'){
+  c.register('finish-all-failed-deployments'){
     finish_all_failed_deployments
   }
   # status
