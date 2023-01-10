@@ -6,7 +6,7 @@ require 'json'
 require 'shellwords'
 require 'cgi'
 
-ORIGIN = 'http://localhost:4646/'
+ORIGIN = 'http://127.0.0.1:4646/'
 OK, FAIL, RIGHT_ARROW, DOT = "\u2714", "\u2716", "\u2794", "\u00B7"
 
 class String
@@ -59,18 +59,15 @@ end
 def request_execute(cmd, params: nil)
   uri = URI("#{ORIGIN}v1/#{cmd}")
 
-  if params
-    
-    resp = Net::HTTP.new(uri.host, uri.port).
-             post(uri.path, params.to_json,
-                  {'Content-Type' => 'application/json'})
-
-    handle_http_response(resp)
+  resp = if params 
+    Net::HTTP.new(uri.host, uri.port).
+      post(uri.path, params.to_json, {'Content-Type' => 'application/json'})
   else
-    resp = Net::HTTP.get_response(URI(uri))
-    handle_http_response(resp)
+    Net::HTTP.get_response(uri)
   end
-rescue SystemCallError => e
+
+  handle_http_response(resp)
+rescue SystemCallError, Timeout::Error => e
   raise NomadRequestError.new(e)
 end
 
@@ -94,7 +91,7 @@ end
 
 def wait_evaluation_complete(id)
   eval_id = id.is_a?(String) ? id : id['EvalID'] 
-  while true
+  loop do
     resp = request("/evaluation/#{eval_id}")
     status = resp["Status"]
     if status != 'blocked' && status != 'pending'
@@ -297,16 +294,16 @@ class JobUpdater
     @prev_version = job_definition["Version"]
     updater.call(job_definition)
     
-    plan_result = request("job/#@id/plan", params: { "Job": job_definition })
+    plan_result = request("job/#@id/plan", params: { Job: job_definition })
     if failed_allocs = plan_result["FailedTGAllocs"]
       puts "Failed to plan job #@id update, aborting update: #{failed_allocs}"
       return false
     end
     
     update_payload = {
-      "Job": job_definition,
-      "EnforceIndex": true,
-      "JobModifyIndex": job_definition["JobModifyIndex"]
+      Job: job_definition,
+      EnforceIndex: true,
+      JobModifyIndex: job_definition["JobModifyIndex"]
     }
     if @pretend
       puts "Pretending to request job #@id update"
@@ -319,9 +316,9 @@ class JobUpdater
 
   def revert
     revert_payload = {
-      "JobID": @id,
-      "JobVersion": @prev_version,
-      "EnforcePriorVersion": @prev_version + 1                
+      JobID: @id,
+      JobVersion: @prev_version,
+      EnforcePriorVersion: @prev_version + 1                
     }
     if @pretend
       puts "Pretending to revert job to #@id to #{@prev_version}"
@@ -340,7 +337,7 @@ class JobUpdater
   
   def wait_deployment_complete_for_id(job_id:)
     idx = 0
-    while true
+    loop do
       deployment = request("/job/#{job_id}/deployment")
       raise NomadObjectNotFound.new("job=#{job_id} not found") unless deployment
       
@@ -374,6 +371,7 @@ def replace_or_add_constraint(constraints, key, val)
 end
 
 def patch_job_to_resolve_collisions!(job, collisions)
+  job_id = job['ID']
   collisions.each do |group_name, collision_index|
     target_group = job['TaskGroups'].find{|group| group["Name"] == group_name }
     raise NomadObjectNotFound.new("group=#{group_name} job=#{job}") unless target_group
@@ -381,9 +379,9 @@ def patch_job_to_resolve_collisions!(job, collisions)
     target_group["Count"] = collision_index + 1
     
     backup_key = "${meta.original_count_backup}"
-    new_constraint = {"LTarget": backup_key,"RTarget": original_count.to_s,"Operand": "!="}
+    new_constraint = {LTarget: backup_key, RTarget: original_count.to_s, Operand: "!="}
     target_group["Constraints"] = replace_or_add_constraint(target_group["Constraints"], backup_key, new_constraint)
-    puts "Group #{group_name} patched: Count = #{original_count} -> #{collision_index+1}, Constraints += #{new_constraint}"
+    puts "Group #{group_name} of job #{job_id} patched: Count = #{original_count} -> #{collision_index+1}, Constraints += #{new_constraint}"
   end
 end
 
@@ -415,7 +413,7 @@ def resolve_collisions(id)
     sleep 2
   end
 
-  puts("Collision %s, executing rollback to job version=%d" % [wait_timeout ? 'timeout' : 'resolved', updater.prev_version])
+  printf("Collision %s, executing rollback to job version=%d\n", wait_timeout ? 'timeout' : 'resolved', updater.prev_version)
   updater.revert.wait_deployment_complete
 end
 
@@ -429,13 +427,14 @@ end
 # move_spec:
 #  group_name != node_name (, ...)?
 def patch_job_to_move_alloc!(job, move_spec)
+  job_id = job['ID']
   move_spec.split(',').each do |move|
     group_name, node = *move.split('!=').map(&:strip)
     target_group = job['TaskGroups'].find{|group| group["Name"] == group_name }
-    raise NomadObjectNotFound.new("group=#{group_name} job=#{job}") unless target_group
-    new_constraint = {"LTarget": "${node.unique.name}", "RTarget": node, "Operand": "!="}
+    raise NomadObjectNotFound.new("group=#{group_name} job=#{job_id}") unless target_group
+    new_constraint = {LTarget: "${node.unique.name}", RTarget: node, Operand: "!="}
     (target_group["Constraints"] ||= []) << new_constraint
-    puts "Group #{group_name} patched: Constraints += #{new_constraint}"
+    puts "Group #{group_name} of #{job_id} patched: Constraints += #{new_constraint}"
   end
 end
 
@@ -454,28 +453,48 @@ def move_alloc(id, alloc_name, to_server)
   updater.revert.wait_deployment_complete
 end
 
-def patch_job_to_redeploy(job, group_name)
+def patch_job_to_redeploy(job, groups)
   now = Time.now.to_i.to_s
-  if group_name
-    target_group = job['TaskGroups'].find{|group| group["Name"] == group_name }
-    (target_group["Meta"] ||= {})["redeploy_at"] = now
-    puts "Group #{group_name} patched: Meta += { redeploy_at = #{now} }"
+  job_id = job['ID']
+  if groups
+    groups.split(',').each do |group_name|
+      target_group = job['TaskGroups'].find{|group| group["Name"] == group_name }
+      raise NomadObjectNotFound.new("group=#{group_name} job=#{job_id}") unless target_group
+      (target_group["Meta"] ||= {})["redeploy_at"] = now
+    end
+    puts "Group(s) #{groups} of job #{job_id} patched: Meta += { redeploy_at = #{now} }"
   else
     (job["Meta"] ||= {})["redeploy_at"] = now
-    puts "Job #{job} patched: Meta += { redeploy_at = #{now} }"
+    puts "Job #{job_id} patched: Meta += { redeploy_at = #{now} }"
   end
 end
 
-def redeploy_job(id, group_name)
+def redeploy_job(id, groups)
   updater = JobUpdater.new(id)
   updater.wait_deployment_complete
-  puts "Redeployting job #{id}"
+  puts "Redeploying job #{id}"
 
   updater.try_update_definition do |job_definition|
-    patch_job_to_redeploy(job_definition, group_name)
+    patch_job_to_redeploy(job_definition, groups)
   end or return
 
   updater.wait_deployment_complete
+end
+
+def restart_job(id)
+  allocs = request("job/#{id}/allocations")
+  raise NomadObjectNotFound.new("job=#{id} allocations") if allocs.empty?
+  
+  allocs.each do |alloc|
+    next if alloc['ClientStatus'] != "running"
+    
+    alloc_id = alloc['ID']
+    print "Executing #{alloc['Name']} (#{alloc_id[0...8]}) restart."
+    request("client/allocation/#{alloc_id}/restart", params: { AllTasks: true })
+    # TODO: how to detect that alloc in healthy state?
+    sleep 1
+    puts 'done'
+  end
 end
 
 def print_job_status(id, only_if_collision: false)
@@ -651,7 +670,7 @@ class Commands
       cmd.call(Arguments.new(cmd_name, arg, extra))
     else
       puts "Command #{cmd_name} not found, known commands:\n\n"
-      puts "    " + @commands.keys.join(', ')
+      puts "    #{@commands.keys.join(', ')}"
     end
   end
 end
@@ -662,6 +681,9 @@ def register_commands
   # allocs monipulation
   c.register('redeploy'){|a|
     redeploy_job(a.arg, a.extra[0])
+  }
+  c.register('restart'){|a|
+    restart_job(a.arg)
   }
   c.register('move'){|a|
     move_alloc(a.arg, a.extra[0], a.extra[1])
@@ -718,6 +740,8 @@ def execute_command(cmd, arg, extra)
     COMMANDS.try_run(cmd, arg, extra)
   rescue NomadObjectNotFound => e
     puts "Object not found: #{e.message}"
+  rescue NomadRequestError => e
+    puts "Request error: #{e.message}"
   end
 end
 
