@@ -28,6 +28,10 @@ def standalone_mode?
   !!ENV['STANDALONE']
 end
 
+def force_mode?
+  !!ENV['FORCE']
+end
+
 class NomadRequestError < StandardError
 end
 
@@ -293,11 +297,13 @@ class JobUpdater
     job_definition = request("job/#@id")
     @prev_version = job_definition["Version"]
     updater.call(job_definition)
-    
-    plan_result = request("job/#@id/plan", params: { Job: job_definition })
-    if failed_allocs = plan_result["FailedTGAllocs"]
-      puts "Failed to plan job #@id update, aborting update: #{failed_allocs}"
-      return false
+
+    unless force_mode?
+      plan_result = request("job/#@id/plan", params: { Job: job_definition })
+      if failed_allocs = plan_result["FailedTGAllocs"]
+        puts "Failed to plan job #@id update, aborting update: #{failed_allocs}"
+        return false
+      end
     end
     
     update_payload = {
@@ -339,9 +345,8 @@ class JobUpdater
     idx = 0
     loop do
       deployment = request("/job/#{job_id}/deployment")
-      raise NomadObjectNotFound.new("job=#{job_id} not found") unless deployment
       
-      if deployment["Status"] == "running"
+      if deployment && deployment["Status"] == "running"
         print(idx == 0 ? "Waiting untill #{job_id} deployment finished" : ".")
         sleep 4
         idx += 1
@@ -372,9 +377,10 @@ end
 
 def patch_job_to_resolve_collisions!(job, collisions)
   job_id = job['ID']
-  collisions.each do |group_name, collision_index|
+  collisions.each do |full_group_name, collision_index|
+    group_name = full_group_name.delete_prefix(job_id + '.')
     target_group = job['TaskGroups'].find{|group| group["Name"] == group_name }
-    raise NomadObjectNotFound.new("group=#{group_name} job=#{job}") unless target_group
+    raise NomadObjectNotFound.new("group=#{group_name} job=#{job_id}") unless target_group
     original_count = target_group["Count"]
     target_group["Count"] = collision_index + 1
     
@@ -410,7 +416,7 @@ def resolve_collisions(id)
     collisions_count = collect_collisions(id).size
     break if collisions_count == 0 || updater.pretend?
     puts "Waiting untill collision resolved ##{it} (has #{collisions_count})"
-    sleep 2
+    sleep 3
   end
 
   printf("Collision %s, executing rollback to job version=%d\n", wait_timeout ? 'timeout' : 'resolved', updater.prev_version)
@@ -440,7 +446,7 @@ end
 
 def move_alloc(id, alloc_name, to_server)
   updater = JobUpdater.new(id)
-  updater.wait_deployment_complete
+  updater.wait_deployment_complete unless force_mode?
   puts "Updating job #{id} to move allocs"
   
   updater.try_update_definition do |job_definition|
@@ -621,17 +627,24 @@ end
 # finish all unfinished deployments by stopping allocs that have old versions
 # must not be run when deployment already running
 def finish_failed_deployment(job_id, pretend: pretend_mode?)
-  subfilter = job_id ? "+and+JobID%3D%3D#{job_id}" : ""
+  subfilter = nil
+  if job_id
+    JobUpdater.new(job_id).wait_deployment_complete
+    subfilter = "+and+JobID%3D%3D#{job_id}"
+  end
+
   allocs = request("allocations?task_states=false&filter=ClientStatus%3D%3Drunning#{subfilter}")
   raise NomadObjectNotFound.new("job=#{job_id} allocations not found") if allocs.empty?
+  
   allocs.group_by{|a| a['JobID'] }.each do |job_id, allocs|
     next if allocs.size < 2
     
     max_version = allocs.map{|a| a['JobVersion'] }.max
     old_allocs = allocs.select{|a| a['JobVersion'] < max_version }
     next if old_allocs.empty?
-    
+
     puts "To stop #{old_allocs.size} allocation in job #{job_id} because they has version < #{max_version}"
+    JobUpdater.new(job_id).wait_deployment_complete
     old_allocs.each do |alloc|
       puts "#{pretend ? "Pretending requesting" : "Requesting"} stop #{alloc["Name"]} with version=#{alloc["JobVersion"]}"
       request("allocation/#{alloc['ID']}/stop", params: {}, wait_evaluation: true) unless pretend
